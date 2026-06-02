@@ -1,12 +1,17 @@
-use encoding_rs::GBK;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Command;
-
-fn decode_gbk(bytes: &[u8]) -> String {
-    let (cow, _, _) = GBK.decode(bytes);
-    cow.into_owned()
-}
+use windows::Win32::NetworkManagement::IpHelper::{
+    GetExtendedTcpTable, GetExtendedUdpTable,
+    MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+    MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+    UDP_TABLE_OWNER_PID,
+};
+use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -34,158 +39,291 @@ pub struct ProcessInfo {
     pub handles: u32,
 }
 
-fn get_all_process_names() -> HashMap<u32, String> {
-    let mut map = HashMap::new();
-    if let Ok(output) = Command::new("tasklist")
-        .args(["/FO", "CSV", "/NH"])
-        .output()
-    {
-        let stdout = decode_gbk(&output.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
-            if parts.len() >= 2 {
-                if let Ok(pid) = parts[1].parse::<u32>() {
-                    map.insert(pid, parts[0].to_string());
-                }
-            }
-        }
+fn get_tcp_state(state: u32) -> String {
+    match state {
+        1 => "CLOSED",
+        2 => "LISTENING",
+        3 => "SYN_SENT",
+        4 => "SYN_RECEIVED",
+        5 => "ESTABLISHED",
+        6 => "FIN_WAIT1",
+        7 => "FIN_WAIT2",
+        8 => "CLOSE_WAIT",
+        9 => "CLOSING",
+        10 => "LAST_ACK",
+        11 => "TIME_WAIT",
+        12 => "DELETE_TCB",
+        _ => "UNKNOWN",
     }
-    map
+    .to_string()
+}
+
+fn format_addr_v4(addr: u32, port: u32) -> (String, u16) {
+    let ip = format!(
+        "{}.{}.{}.{}",
+        addr & 0xff,
+        (addr >> 8) & 0xff,
+        (addr >> 16) & 0xff,
+        (addr >> 24) & 0xff
+    );
+    let p = (port as u16).swap_bytes();
+    (format!("{}:{}", ip, p), p)
+}
+
+fn format_addr_v6(addr: &[u8; 16], port: u32) -> (String, u16) {
+    let groups: Vec<String> = (0..8)
+        .map(|i| format!("{:04x}", ((addr[i * 2] as u16) << 8) | addr[i * 2 + 1] as u16))
+        .collect();
+    let ip = groups.join(":");
+    let p = (port as u16).swap_bytes();
+    (format!("[{}]:{}", ip, p), p)
 }
 
 #[tauri::command]
 fn get_port_connections() -> Result<Vec<PortConnection>, String> {
-    let netstat_output = Command::new("netstat")
-        .args(["-ano"])
-        .output()
-        .map_err(|e| format!("Failed to run netstat: {}", e))?;
+    let mut connections = Vec::new();
+    let mut id_counter = 0;
 
-    let stdout = decode_gbk(&netstat_output.stdout);
-    let mut raw_connections = Vec::new();
+    unsafe {
+        let mut buf_len: u32 = 0;
+        GetExtendedTcpTable(None, &mut buf_len, false, AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0);
 
-    for line in stdout.lines().skip(4) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 {
-            continue;
+        if buf_len > 0 {
+            let mut buf = vec![0u8; buf_len as usize];
+            if GetExtendedTcpTable(Some(buf.as_mut_ptr() as *mut _), &mut buf_len, false, AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0) == 0 {
+                let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
+                let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+                for row in rows {
+                    let (addr_str, port) = format_addr_v4(row.dwLocalAddr, row.dwLocalPort);
+                    let (remote_str, _) = format_addr_v4(row.dwRemoteAddr, row.dwRemotePort);
+                    connections.push(PortConnection {
+                        id: format!("port-{}", id_counter),
+                        port,
+                        protocol: "TCP".to_string(),
+                        local_address: addr_str,
+                        remote_address: remote_str,
+                        state: get_tcp_state(row.dwState),
+                        pid: row.dwOwningPid,
+                        process_name: String::new(),
+                        process_path: String::new(),
+                    });
+                    id_counter += 1;
+                }
+            }
         }
 
-        let protocol = parts[0].to_string();
-        let local_addr = parts[1].to_string();
-        let remote_addr = parts[2].to_string();
-        let state = if protocol.starts_with("TCP") {
-            parts[3].to_string()
-        } else {
-            "*".to_string()
-        };
-        let pid: u32 = if protocol.starts_with("TCP") {
-            parts[4].parse().unwrap_or(0)
-        } else {
-            parts[3].parse().unwrap_or(0)
-        };
+        buf_len = 0;
+        GetExtendedTcpTable(None, &mut buf_len, false, AF_INET6.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0);
 
-        let port = local_addr
-            .split(':')
-            .last()
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(0);
+        if buf_len > 0 {
+            let mut buf = vec![0u8; buf_len as usize];
+            if GetExtendedTcpTable(Some(buf.as_mut_ptr() as *mut _), &mut buf_len, false, AF_INET6.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0) == 0 {
+                let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
+                let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+                for row in rows {
+                    let (addr_str, port) = format_addr_v6(&row.ucLocalAddr, row.dwLocalPort);
+                    let (remote_str, _) = format_addr_v6(&row.ucRemoteAddr, row.dwRemotePort);
+                    connections.push(PortConnection {
+                        id: format!("port-{}", id_counter),
+                        port,
+                        protocol: "TCP6".to_string(),
+                        local_address: addr_str,
+                        remote_address: remote_str,
+                        state: get_tcp_state(row.dwState),
+                        pid: row.dwOwningPid,
+                        process_name: String::new(),
+                        process_path: String::new(),
+                    });
+                    id_counter += 1;
+                }
+            }
+        }
 
-        raw_connections.push((protocol, local_addr, remote_addr, state, pid, port));
+        buf_len = 0;
+        GetExtendedUdpTable(None, &mut buf_len, false, AF_INET.0 as u32, UDP_TABLE_OWNER_PID, 0);
+
+        if buf_len > 0 {
+            let mut buf = vec![0u8; buf_len as usize];
+            if GetExtendedUdpTable(Some(buf.as_mut_ptr() as *mut _), &mut buf_len, false, AF_INET.0 as u32, UDP_TABLE_OWNER_PID, 0) == 0 {
+                let table = &*(buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID);
+                let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+                for row in rows {
+                    let (addr_str, port) = format_addr_v4(row.dwLocalAddr, row.dwLocalPort);
+                    connections.push(PortConnection {
+                        id: format!("port-{}", id_counter),
+                        port,
+                        protocol: "UDP".to_string(),
+                        local_address: addr_str,
+                        remote_address: "*:*".to_string(),
+                        state: "*".to_string(),
+                        pid: row.dwOwningPid,
+                        process_name: String::new(),
+                        process_path: String::new(),
+                    });
+                    id_counter += 1;
+                }
+            }
+        }
+
+        buf_len = 0;
+        GetExtendedUdpTable(None, &mut buf_len, false, AF_INET6.0 as u32, UDP_TABLE_OWNER_PID, 0);
+
+        if buf_len > 0 {
+            let mut buf = vec![0u8; buf_len as usize];
+            if GetExtendedUdpTable(Some(buf.as_mut_ptr() as *mut _), &mut buf_len, false, AF_INET6.0 as u32, UDP_TABLE_OWNER_PID, 0) == 0 {
+                let table = &*(buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID);
+                let rows = std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+                for row in rows {
+                    let (addr_str, port) = format_addr_v4(row.dwLocalAddr, row.dwLocalPort);
+                    connections.push(PortConnection {
+                        id: format!("port-{}", id_counter),
+                        port,
+                        protocol: "UDP6".to_string(),
+                        local_address: addr_str,
+                        remote_address: "*:*".to_string(),
+                        state: "*".to_string(),
+                        pid: row.dwOwningPid,
+                        process_name: String::new(),
+                        process_path: String::new(),
+                    });
+                    id_counter += 1;
+                }
+            }
+        }
     }
 
     let process_map = get_all_process_names();
 
-    let connections: Vec<PortConnection> = raw_connections
-        .into_iter()
-        .enumerate()
-        .map(|(i, (protocol, local_addr, remote_addr, state, pid, port))| {
-            let process_name = process_map
-                .get(&pid)
-                .cloned()
-                .unwrap_or_else(|| "Unknown".to_string());
-
-            PortConnection {
-                id: format!("port-{}", i),
-                port,
-                protocol,
-                local_address: local_addr,
-                remote_address: remote_addr,
-                state,
-                pid,
-                process_name,
-                process_path: String::new(),
-            }
-        })
-        .collect();
+    for conn in &mut connections {
+        conn.process_name = process_map
+            .get(&conn.pid)
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string());
+        conn.process_path = get_process_path(conn.pid);
+    }
 
     Ok(connections)
 }
 
-#[tauri::command]
-fn get_process_details(pid: u32) -> Result<ProcessInfo, String> {
-    let output = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {}", pid), "/V", "/FO", "CSV"])
-        .output()
-        .map_err(|e| format!("Failed to run tasklist: {}", e))?;
+fn get_all_process_names() -> HashMap<u32, String> {
+    let mut map = HashMap::new();
 
-    let stdout = decode_gbk(&output.stdout);
-    
-    for line in stdout.lines().skip(1) {
-        let parts: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
-        if parts.len() >= 8 {
-            let name = parts[0].to_string();
-            let pid_str = parts[1].to_string();
-            let mem_str = parts[4].replace(" K", "").replace(",", "");
-            let memory_kb: f64 = mem_str.parse().unwrap_or(0.0);
-            
-            return Ok(ProcessInfo {
-                pid: pid_str.parse().unwrap_or(pid),
-                name,
-                path: String::new(),
-                cpu_usage: 0.0,
-                memory_mb: memory_kb / 1024.0,
-                threads: 0,
-                handles: 0,
-            });
+    unsafe {
+        if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+
+            if Process32FirstW(snapshot, &mut entry).is_ok() {
+                let name = String::from_utf16_lossy(
+                    &entry.szExeFile[..entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(260)],
+                );
+                map.insert(entry.th32ProcessID, name);
+
+                while Process32NextW(snapshot, &mut entry).is_ok() {
+                    let name = String::from_utf16_lossy(
+                        &entry.szExeFile
+                            [..entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(260)],
+                    );
+                    map.insert(entry.th32ProcessID, name);
+                }
+            }
         }
     }
 
-    Err(format!("Process with PID {} not found", pid))
+    map
+}
+
+fn get_process_path(pid: u32) -> String {
+    unsafe {
+        if let Ok(handle) = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) {
+            let mut buffer = [0u16; 1024];
+            let len = K32GetModuleFileNameExW(Some(handle), None, &mut buffer);
+            if len > 0 {
+                return String::from_utf16_lossy(&buffer[..len as usize]);
+            }
+        }
+    }
+    String::new()
+}
+
+#[tauri::command]
+fn get_process_details(pid: u32) -> Result<ProcessInfo, String> {
+    let process_map = get_all_process_names();
+    let name = process_map
+        .get(&pid)
+        .cloned()
+        .unwrap_or_else(|| "Unknown".to_string());
+    let path = get_process_path(pid);
+
+    let mut threads = 0u32;
+    let mut handles = 0u32;
+
+    unsafe {
+        use windows::Win32::System::Threading::GetProcessHandleCount;
+
+        if let Ok(handle) = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) {
+            let mut handle_count = 0u32;
+            let _ = GetProcessHandleCount(handle, &mut handle_count);
+            handles = handle_count;
+
+            if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+                let mut entry = PROCESSENTRY32W {
+                    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                    ..Default::default()
+                };
+
+                if Process32FirstW(snapshot, &mut entry).is_ok() {
+                    if entry.th32ProcessID == pid {
+                        threads = entry.cntThreads;
+                    }
+                    while Process32NextW(snapshot, &mut entry).is_ok() {
+                        if entry.th32ProcessID == pid {
+                            threads = entry.cntThreads;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ProcessInfo {
+        pid,
+        name,
+        path,
+        cpu_usage: 0.0,
+        memory_mb: 0.0,
+        threads,
+        handles,
+    })
 }
 
 #[tauri::command]
 fn kill_process(pid: u32) -> Result<bool, String> {
-    let output = Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
-        .output()
-        .map_err(|e| format!("Failed to kill process: {}", e))?;
+    use windows::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
 
-    if output.status.success() {
-        Ok(true)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Failed to kill process: {}", stderr))
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, false, pid)
+            .map_err(|e| format!("Failed to open process: {}", e))?;
+        TerminateProcess(handle, 1).map_err(|e| format!("Failed to kill process: {}", e))?;
     }
+
+    Ok(true)
 }
 
 #[tauri::command]
 fn suspend_process(pid: u32) -> Result<bool, String> {
-    let output = Command::new("powershell")
-        .args([
-            "-Command",
-            &format!(
-                "Suspend-Process -Id {} -ErrorAction Stop",
-                pid
-            ),
-        ])
-        .output()
-        .map_err(|e| format!("Failed to suspend process: {}", e))?;
+    use windows::Win32::System::Threading::{SuspendThread, PROCESS_SUSPEND_RESUME};
 
-    if output.status.success() {
-        Ok(true)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Failed to suspend process: {}", stderr))
+    unsafe {
+        let handle = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid)
+            .map_err(|e| format!("Failed to open process: {}", e))?;
+        SuspendThread(handle);
     }
+
+    Ok(true)
 }
 
 pub fn run() {
