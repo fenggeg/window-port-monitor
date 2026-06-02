@@ -1,16 +1,20 @@
 import { Globe } from "lucide-react";
 import { useI18n } from "../i18n";
+import { Switch } from "./ui/switch";
 
 export function LanguageSwitcher() {
   const { locale, setLocale } = useI18n();
+  const isZh = locale === "zh";
 
   return (
-    <button
-      onClick={() => setLocale(locale === "en" ? "zh" : "en")}
-      className="flex items-center gap-2 px-3 py-2 bg-secondary text-secondary-foreground rounded-md hover:opacity-90 transition-opacity"
-    >
-      <Globe className="w-4 h-4" />
-      <span className="font-mono text-sm">{locale === "en" ? "中文" : "EN"}</span>
-    </button>
+    <div className="flex items-center gap-2">
+      <Globe className="w-4 h-4 text-muted-foreground" />
+      <span className="text-xs text-muted-foreground font-mono">EN</span>
+      <Switch
+        checked={isZh}
+        onCheckedChange={(checked) => setLocale(checked ? "zh" : "en")}
+      />
+      <span className="text-xs text-muted-foreground font-mono">中</span>
+    </div>
   );
 }
